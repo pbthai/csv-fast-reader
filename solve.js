@@ -1,107 +1,133 @@
-// Delimiter positions are cached within a case so native string searches scan
-// each line ending once. Unchanged field contents remain source slices.
-export function run(input) {
-  const text = String(input.text), header = input.header === true;
-  const n = text.length, rows = [], errors = [];
-  let columns = null, width = -1, line = 1;
-  let p = text.charCodeAt(0) === 0xfeff ? 1 : 0;
-  let lf = text.indexOf('\n', p), cr = text.indexOf('\r', p);
-  let quote = text.indexOf('"', p);
-  if (quote < 0) quote = n;
-  if (lf < 0) lf = n;
-  if (cr < 0) cr = n;
-  while (p < n) {
-    const first = text.charCodeAt(p);
-    if (first === 10 || (first === 13 && text.charCodeAt(p + 1) === 10)) {
-      p += first === 10 ? 1 : 2;
-      line++;
-      continue;
-    }
-    const recordLine = line, recordRow = header && columns === null ? null : rows.length;
-    if (lf < p) { lf = text.indexOf('\n', p); if (lf < 0) lf = n; }
-    if (cr < p) { cr = text.indexOf('\r', p); if (cr < 0) cr = n; }
-    if (quote < p) { quote = text.indexOf('"', p); if (quote < 0) quote = n; }
-    let fields;
-    let more = true, quoted = false;
-    const plainEnd = cr + 1 === lf && lf < n ? cr : lf;
-    if (quote >= plainEnd && cr >= plainEnd) {
-      fields = text.slice(p, plainEnd).split(',');
-      p = lf < n ? lf + 1 : n;
-      if (lf < n) line++;
-      more = false;
-    } else fields = [];
-    while (more) {
-      quoted = text.charCodeAt(p) === 34;
-      let value = '', junk = false;
-      if (quoted) {
-        const open = p;
-        let close = text.indexOf('"', p + 1), escaped = false;
-        while (close >= 0 && text.charCodeAt(close + 1) === 34) {
-          escaped = true;
-          close = text.indexOf('"', close + 2);
-        }
-        if (close < 0) {
-          errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
-          value = '"';
-          p++;
-        } else {
-          value = text.slice(open + 1, close);
-          if (escaped) value = value.replaceAll('""', '"');
-          if (lf < open) { lf = text.indexOf('\n', open); if (lf < 0) lf = n; }
-          if (cr < open) { cr = text.indexOf('\r', open); if (cr < 0) cr = n; }
-          if (cr < close) value = value.replace(/\r\n?/g, '\n');
-          while (lf < close) {
-            line++;
-            lf = text.indexOf('\n', lf + 1);
-            if (lf < 0) lf = n;
-          }
-          while (cr < close) {
-            if (text.charCodeAt(cr + 1) !== 10) line++;
-            cr = text.indexOf('\r', cr + 1);
-            if (cr < 0) cr = n;
-          }
-          p = close + 1;
-          junk = true;
-        }
-      }
-      if (lf < p) { lf = text.indexOf('\n', p); if (lf < 0) lf = n; }
-      if (cr < p) { cr = text.indexOf('\r', p); if (cr < 0) cr = n; }
-      let comma = text.indexOf(',', p);
-      if (comma < 0) comma = n;
-      const boundary = Math.min(comma, lf);
-      let added = 0;
-      while (cr < boundary && (cr + 1 !== lf || lf === n)) {
-        value += text.slice(p, cr);
-        added += cr - p;
-        p = cr + 1;
-        errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
-        cr = text.indexOf('\r', p);
-        if (cr < 0) cr = n;
-      }
-      const end = Math.min(boundary, cr);
-      value += text.slice(p, end);
-      added += end - p;
-      if (junk && added) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
-      fields.push(value);
-      more = end === comma && end < n;
-      if (more) p = end + 1;
-      else {
-        p = end < n ? lf + 1 : n;
-        if (end < n) line++;
-      }
-    }
-    if (fields.length === 1 && fields[0] === '' && !quoted) continue;
-    if (width < 0) width = fields.length;
-    if (header && columns === null) columns = fields;
-    else {
-      if (fields.length < width) {
-        errors.push({ code: 'short_row', line: recordLine, row: recordRow, fields: fields.length });
-        while (fields.length < width) fields.push('');
-      } else if (fields.length > width) {
-        errors.push({ code: 'long_row', line: recordLine, row: recordRow, extra: fields.splice(width) });
-      }
-      rows.push(fields);
-    }
+import { run as fallback } from './fallback.js';
+
+// Emit JSON bytes directly, preserving UTF-8 and escaping JSON controls.
+// The public interface returns values; the driver requests the encoded form.
+export function run(input, encoded = false) {
+  const bytes = encoded && Buffer.isBuffer(input.text);
+  const text = bytes ? null : String(input.text);
+  if (!bytes && !text.isWellFormed()) {
+    const value = fallback(input);
+    return encoded ? Buffer.from(JSON.stringify(value)) : value;
   }
-  return { columns: header ? (columns ?? []) : null, rows, errors };
+  const source = bytes ? input.text : Buffer.from(text);
+  const n = source.length, header = input.header === true;
+  let out = Buffer.allocUnsafe(n * 6 + 1024), w = 0;
+  let p = n >= 3 && source[0] === 239 && source[1] === 187 && source[2] === 191 ? 3 : 0;
+  let line = 1, row = 0, width = -1, haveHeader = false;
+  const errors = [];
+  w = out.write(header ? '{"columns":' : '{"columns":null,"rows":[');
+  while (p < n) {
+    if (source[p] === 10 || (source[p] === 13 && source[p + 1] === 10)) {
+      p += source[p] === 10 ? 1 : 2; line++; continue;
+    }
+    const recordLine = line, recordRow = header && !haveHeader ? null : row;
+    // Reserve for all remaining input escapes and this record's padding. This
+    // also handles inputs whose width makes padding larger than the CSV itself.
+    const needed = w + (n - p) * 6 + Math.max(0, width) * 3 + 32;
+    if (needed > out.length) {
+      const grown = Buffer.allocUnsafe(Math.max(out.length * 2, needed));
+      out.copy(grown, 0, 0, w); out = grown;
+    }
+    const recordStart = w;
+    if (recordRow !== null && row) out[w++] = 44;
+    out[w++] = 91;
+    let fields = 0, more = true, quoted = false, empty = true, extraStart = -1;
+    while (more) {
+      if (fields) out[w++] = 44;
+      if (width >= 0 && fields === width) extraStart = w;
+      out[w++] = 34;
+      quoted = source[p] === 34;
+      empty = true;
+      let junk = false;
+      if (quoted) {
+        let close = source.indexOf(34, p + 1);
+        while (close >= 0 && source[close + 1] === 34) close = source.indexOf(34, close + 2);
+        if (close < 0) { errors.push(error('unterminated_quote', recordLine, recordRow)); w = escape(out, w, 34); p++; empty = false; }
+        else {
+          p++;
+          while (p < close) {
+            const c = source[p];
+            if (c === 34 || c === 92 || c < 32) {
+              if (c === 13) { w = escape(out, w, 10); line++; p += source[p + 1] === 10 ? 2 : 1; }
+              else { w = escape(out, w, c); if (c === 10) line++; p += c === 34 ? 2 : 1; }
+            } else { const end = copyQuoted(source, p, close, out, w); w += end - p; p = end; }
+          }
+          empty = false; p++; junk = true;
+        }
+      }
+      let start = p, added = false;
+      for (;;) {
+        const c = p < n ? source[p] : -1;
+        if (c === -1 || c === 44 || c === 10 || (c === 13 && source[p + 1] === 10)) {
+          if (p > start) { empty = false; added = true; }
+          more = c === 44;
+          if (c !== -1) { p += c === 13 ? 2 : 1; if (!more) line++; }
+          break;
+        }
+        if (c === 13 || c === 34 || c === 92 || c < 32) {
+          if (p > start) { empty = false; added = true; }
+          if (c === 13) errors.push(error('stray_cr', recordLine, recordRow));
+          else { w = escape(out, w, c); empty = false; added = true; }
+          p++; start = p;
+        } else { const end = copyBare(source, p, n, out, w); w += end - p; p = end; }
+      }
+      if (junk && added) errors.push(error('quote_junk', recordLine, recordRow));
+      out[w++] = 34; fields++;
+    }
+    if (fields === 1 && empty && !quoted) { w = recordStart; continue; }
+    if (width < 0) width = fields;
+    if (recordRow !== null) {
+      if (fields < width) {
+        errors.push(error('short_row', recordLine, recordRow, ',"fields":' + fields));
+        for (let i = fields; i < width; i++) { out[w++] = 44; out[w++] = 34; out[w++] = 34; }
+      } else if (fields > width) {
+        errors.push(error('long_row', recordLine, recordRow, ',"extra":[' + out.toString('utf8', extraStart, w) + ']'));
+        w = extraStart - 1;
+      }
+    }
+    out[w++] = 93;
+    if (recordRow === null) { haveHeader = true; w += out.write(',"rows":[', w); }
+    else row++;
+  }
+  if (header && !haveHeader) w += out.write('[],"rows":[', w);
+  const tail = Buffer.from('],"errors":[' + errors.join(',') + ']}');
+  const result = Buffer.concat([out.subarray(0, w), tail]);
+  return encoded ? result : JSON.parse(result.toString('utf8'));
+}
+
+function escape(out, w, c) {
+  out[w++] = 92;
+  if (c === 34 || c === 92) out[w++] = c;
+  else if (c === 10) out[w++] = 110;
+  else if (c === 13) out[w++] = 114;
+  else if (c === 9) out[w++] = 116;
+  else if (c === 8) out[w++] = 98;
+  else if (c === 12) out[w++] = 102;
+  else {
+    out[w++] = 117; out[w++] = 48; out[w++] = 48;
+    out[w++] = 48 + (c >> 4); const low = c & 15;
+    out[w++] = low < 10 ? 48 + low : 87 + low;
+  }
+  return w;
+}
+
+function error(code, line, row, extra = '') {
+  return '{"code":"' + code + '","line":' + line + ',"row":' + row + extra + '}';
+}
+
+function copyBare(source, p, n, out, w) {
+  while (p < n) {
+    const c = source[p];
+    if (c < 32 || c === 34 || c === 44 || c === 92) break;
+    out[w++] = c; p++;
+  }
+  return p;
+}
+function copyQuoted(source, p, end, out, w) {
+  while (p < end) {
+    const c = source[p];
+    if (c < 32 || c === 34 || c === 92) break;
+    out[w++] = c; p++;
+  }
+  return p;
 }
